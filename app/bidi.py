@@ -58,6 +58,17 @@ _BIDI_TABLE: dict[int, tuple[str, str, BidiKind, bool, str]] = {
 EMBEDDING_OPENERS = {0x202A, 0x202B, 0x202D, 0x202E}
 ISOLATE_OPENERS = {0x2066, 0x2067, 0x2068}
 
+# Every bidi/formatting control the parser recognises.  Other auditors
+# (e.g. the CSV formula-spoofing scanner) reuse this set instead of
+# maintaining their own catalogue.
+BIDI_CODEPOINTS: frozenset[int] = frozenset(_BIDI_TABLE)
+
+# Codepoint -> short abbreviation (e.g. 0x202E -> "RLO") for auditors
+# that only need to label a control character.
+BIDI_ABBREVIATIONS: dict[int, str] = {
+    cp: info[0] for cp, info in _BIDI_TABLE.items()
+}
+
 # Limit from BD13 (61) plus the isolate level; exceeding it is an error.
 MAX_DEPTH = 125
 

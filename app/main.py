@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
+from .csv_audit import CsvParseError, audit_csv
 from .database import (
     count_audits,
     get_audit,
@@ -37,6 +38,7 @@ from .sarif import build_sarif
 from .schemas import (
     AuditRequest,
     CompareRequest,
+    CsvAuditRequest,
     DiffAuditRequest,
     GateRequest,
     IdentifierCollisionFixRequest,
@@ -289,6 +291,40 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/audits/csv")
+def audit_csv_document(payload: CsvAuditRequest) -> dict:
+    """Audit raw CSV text for spreadsheet formula-spoofing cells.
+
+    Parses the CSV per RFC 4180 (comma separators, double-quote
+    enclosure, doubled quotes as escapes, CRLF record breaks) with full
+    position tracking, so quoted line breaks, escaped quotes and empty
+    cells never shift record/field numbering or line/column positions.
+    For every cell, leading spaces, tabs and Unicode bidi control
+    characters are skipped; a cell whose first remaining character is
+    ``=``, ``+``, ``-`` or ``@`` is reported with its 1-based record and
+    field numbers, the trigger's line/column in the original text and
+    the skipped prefix controls.  Each reported cell is also run through
+    the shared bidi parser for its risk level.  Read-only: nothing is
+    persisted.  Unclosed quotes, illegal quotes or non-CRLF record
+    breaks yield 422 carrying the offending original-text position.
+    """
+    try:
+        report = audit_csv(payload.csv)
+    except CsvParseError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_csv",
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+    report["filename"] = payload.filename
+    return report
+
+
 @app.post("/api/v1/identifiers/normalization", status_code=201)
 def create_identifier_normalization(payload: IdentifierNormalizationRequest) -> dict:
     """Extract Python identifiers and report NFKC normalisation collisions.
@@ -501,6 +537,7 @@ def root() -> dict:
             "POST /api/v1/audits",
             "POST /api/v1/audits/diff",
             "POST /api/v1/audits/json",
+            "POST /api/v1/audits/csv",
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",

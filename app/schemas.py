@@ -45,6 +45,26 @@ class DiffAuditRequest(BaseModel):
     )
 
 
+class CsvAuditRequest(BaseModel):
+    csv: str = Field(
+        ...,
+        description=(
+            "Raw CSV text. Parsed per RFC 4180 (comma-separated fields, "
+            "double-quote enclosure, doubled-quote escaping, CRLF record "
+            "breaks); an unclosed quote, illegal quote or non-CRLF record "
+            "break outside a quoted field is rejected with 422. Every "
+            "cell whose first non-space/tab/bidi-control character is "
+            "=, +, - or @ is reported as a formula-spoofing finding. "
+            "Read-only: nothing is persisted."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional document name, echoed back in the response.",
+    )
+
+
 class JsonAuditRequest(BaseModel):
     document: str = Field(
         ...,

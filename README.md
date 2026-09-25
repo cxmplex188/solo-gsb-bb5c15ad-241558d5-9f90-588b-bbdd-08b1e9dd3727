@@ -50,6 +50,7 @@ docker compose up --build
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
+`POST /api/v1/audits/csv`、
 `POST /api/v1/audits/gate`、
 `POST /api/v1/identifiers/normalization`、
 `POST /api/v1/identifiers/normalization/fix-preview` 与
@@ -385,6 +386,108 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
 
 `invalid_json_document` 的 `detail` 含 `offset`（出错位置的码点偏移）与
 `line` / `column`（1 起始）。
+
+### `POST /api/v1/audits/csv` — CSV 单元格公式伪装审计
+
+接收**原始 CSV 文本**（`csv` 字段，可选 `filename` 原样回显），按
+[RFC 4180](https://datatracker.ietf.org/doc/html/rfc4180) 解析：
+
+- 逗号（`,`）分隔字段、双引号（`"`）包围字段、字段内连续两个双引号
+  （`""`）转义为一个字面引号；记录之间必须是 **CRLF（`\r\n`）**；
+- 双引号只能出现在字段最开头；引号未闭合、未加引号字段中出现裸引号、
+  闭合引号后紧跟非法字符，以及引号外出现裸 LF / CR，一律返回 **422**，
+  `detail` 携带出错字符在**原文中的行列与码点偏移**；
+- **引号内的换行（CRLF 或裸 LF）、转义引号与空单元格都不会造成记录号、
+  字段号或行列错位**。
+
+对每个单元格，从内容开头跳过**空格（U+0020）、制表符（U+0009）及
+Unicode 双向控制符**后，若首字符为 `=`、`+`、`-`、`@`（电子表格软件会把
+这类单元格当作公式执行——CSV 公式注入 / CVE-2014-3524 类攻击面），报告一条
+finding：
+
+- `record_no` / `field_no` — 1 起始的记录号与记录内字段号；
+- `position` — 公式起始字符（`=` / `+` / `-` / `@`）在**原文中的行列**；
+- `trigger` — 公式起始字符本身；
+- `prefix_control_chars[]` — 被跳过的前缀字符：普通空白标为 `space` /
+  `tab`，双向控制符标为 `bidi:<缩写>`（如 `bidi:RLO`），每项含 `codepoint`、
+  原文码点偏移与 1 起始行列——用于识别「bidi 控制符把 `=` 藏到视觉首位」
+  之类的伪装；
+- `cell_position` — 整个单元格在原文中的起止行列；
+- `risk_level` 与 `result` — **复用现有 bidi 解析器**对该单元格（解码后的
+  单元格内容）给出的风险级别与完整解析结果，因此单元格内其他位置的
+  RLO/LRI 等控制符同样体现在评级中。
+
+该接口**只读**：`stored: false`，不写入任何审计记录。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/csv \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"csv": "name,note\r\n\u202E=HYPERLINK(\"http://evil\")\r\n"}' | jq
+```
+
+> 上例第二个单元格以 RLO（U+202E，JSON 中写作 `\u202E`）开头、紧跟 `=`，
+
+响应（节选）：
+
+```json
+{
+  "stored": false,
+  "filename": null,
+  "record_count": 2,
+  "cell_count": 3,
+  "finding_count": 1,
+  "risk_level": "critical",
+  "records": [
+    {"record_no": 1, "field_count": 2, "start_line": 1},
+    {"record_no": 2, "field_count": 2, "start_line": 2}
+  ],
+  "findings": [
+    {
+      "record_no": 2,
+      "field_no": 1,
+      "position": {"line": 2, "column": 2},
+      "trigger": "=",
+      "prefix_control_chars": [
+        {"char": "‮", "codepoint": "U+202E", "kind": "bidi:RLO",
+         "offset": 11, "position": {"line": 2, "column": 1}}
+      ],
+      "cell_position": {"start": {"line": 2, "column": 1},
+                        "end": {"line": 2, "column": 27}},
+      "risk_level": "critical",
+      "result": { "risk_level": "critical", "controls": ["…同 /audits 的原始解析结果…"] }
+    }
+  ]
+}
+```
+
+说明：
+
+- 顶层 `risk_level` 取所有命中单元格 bidi 风险级别的最高值；没有任何公式
+  单元格时为 `info`。普通单元格（非公式前缀）不单独评级。
+- `records[]` 仅给出记录号、字段数与该记录起始原文行，便于核对引号内换行
+  不会增加记录数；行列与偏移均按 **Unicode 码点**计算，列 1 起始。
+- 空输入（`""`）合法，返回 0 条记录；记录末尾的单个 CRLF 不产生额外空记录。
+- 引号包围的字段内允许出现逗号、引号（`""` 转义）与换行（CRLF / 裸 LF 均可），
+  全部按字段内容逐字解析；但引号**外**的裸 LF / CR 不是合法记录分隔符。
+
+错误情况：
+
+| 状态码 | 条件 |
+|---|---|
+| `422` | 引号未闭合、未加引号字段中出现裸双引号、闭合引号后出现非 `,` / CRLF / 结尾的字符，或引号外出现裸 LF / CR（`detail.error` 为 `invalid_csv`，含 `offset` / `line` / `column`） |
+| `422` | 请求体缺少 `csv` 字段（Pydantic 校验） |
+
+```json
+{
+  "detail": {
+    "error": "invalid_csv",
+    "offset": 3,
+    "line": 1,
+    "column": 4,
+    "message": "unescaped double quote in unquoted field: fields containing '\"' must be enclosed in double quotes"
+  }
+}
+```
 
 ### `POST /api/v1/identifiers/normalization` — Python 标识符 NFKC 碰撞检测
 
@@ -1058,6 +1161,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
+│   ├── csv_audit.py   # RFC 4180 CSV 解析（逗号/引号包围/双引号转义/CRLF/位置跟踪）+ 单元格公式伪装审计
 │   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移、碰撞修复预览与拉丁/希腊/西里尔混写检测
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
@@ -1072,6 +1176,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
+│   ├── test_csv_audit.py # CSV 公式伪装审计（RFC 4180 解析/前缀控制符/原文行列/引号换行与转义不错位/422/只读）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
 │   ├── test_mixed_script.py # 标识符混写检测（脚本分类/逐字符偏移/逐次报告/BOM/CRLF/422/不落库）
@@ -1118,7 +1223,15 @@ JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指
 多行文档行列、根字符串、纯标量零记录、逐值落库与文件名 `#指针` 规则、
 记录 verify/sarif 一致，以及 422 分支（空文档、截断、非法转义、`\u` 非十六进制、
 孤立高/低代理项、字符串内未转义控制字符、数字格式错误、尾随内容、嵌套超深、
-重复键含解码后重复与嵌套重复——均不落库）；路径风险门禁覆盖段内 `*`
+重复键含解码后重复与嵌套重复——均不落库）；CSV 单元格公式伪装审计覆盖
+RFC 4180 解析（逗号分隔、双引号包围、`""` 转义解码、CRLF 记录分隔、末尾 CRLF
+不产生空记录、空输入零记录与空单元格计字段）、四个公式触发字符 `=`/`+`/`-`/`@`
+的记录号/字段号与原文行列、跳过空格/Tab/bidi 前缀并逐项报告前缀控制符
+（含 RLO/LRM/RLM 等种类、码点偏移与位置）、复用 bidi 解析器的单元格风险级别
+与整体最高风险、引号内 CRLF 与裸 LF 换行及转义引号不错位（后续记录行号与
+字段号正确）、空单元格间字段编号连续、以及 422 分支（引号未闭合定位到开启
+引号、未加引号字段裸引号、闭合引号后非法字符、引号外裸 LF/CR、跨行后错误
+仍定位到原文行列）与接口只读不落库；路径风险门禁覆盖段内 `*`
 （不跨 `/`，含 `*.py` 扩展名规则）、`**` 零段/一段/多段/连续 `**`/模板中部
 与边界匹配、固定段数优先、同固定段数时总段数优先、仍同分时请求靠前优先、
 未命中与无文件名回退默认阈值、阈值边界包含判定、风险排序与整体结论、
