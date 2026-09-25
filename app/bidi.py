@@ -58,6 +58,16 @@ _BIDI_TABLE: dict[int, tuple[str, str, BidiKind, bool, str]] = {
 EMBEDDING_OPENERS = {0x202A, 0x202B, 0x202D, 0x202E}
 ISOLATE_OPENERS = {0x2066, 0x2067, 0x2068}
 
+#: Codepoints of every character the parser treats as a bidi control.
+BIDI_CONTROL_CODEPOINTS = frozenset(_BIDI_TABLE)
+
+
+def control_abbreviation(codepoint: int) -> Optional[str]:
+    """Abbreviation (``"RLO"`` ...) of the bidi control at ``codepoint``,
+    or ``None`` when the character is not a known bidi control."""
+    info = _BIDI_TABLE.get(codepoint)
+    return info[0] if info is not None else None
+
 # Limit from BD13 (61) plus the isolate level; exceeding it is an error.
 MAX_DEPTH = 125
 

@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
+from .csv_audit import CsvParseError, audit_csv_document
 from .database import (
     count_audits,
     get_audit,
@@ -37,6 +38,7 @@ from .sarif import build_sarif
 from .schemas import (
     AuditRequest,
     CompareRequest,
+    CsvAuditRequest,
     DiffAuditRequest,
     GateRequest,
     IdentifierCollisionFixRequest,
@@ -289,6 +291,47 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/audits/csv")
+def audit_csv_formula_cells(payload: CsvAuditRequest) -> dict:
+    """Flag CSV cells disguised as spreadsheet formulas.
+
+    Parses the raw CSV text (comma-separated fields, double-quoted
+    enclosures with ``""`` escapes, CRLF/LF record breaks) and checks
+    every cell: after skipping a prefix of spaces, tabs and Unicode
+    bidi control characters, a first character of ``=``, ``+``, ``-``
+    or ``@`` is reported with its 1-based record/field numbers, the
+    formula character's offset and line/column in the original
+    document, the skipped prefix characters and the cell's bidi risk
+    level from the existing parser.  Read-only: nothing is persisted.
+    Unclosed or illegal quotes yield 422 with the original line/column.
+    """
+    try:
+        report = audit_csv_document(payload.document)
+    except CsvParseError as exc:
+        line, column = line_col(payload.document, exc.offset)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": line,
+                "column": column,
+                "message": exc.message,
+            },
+        )
+    findings = [finding.to_dict() for finding in report.findings]
+    return {
+        "stored": False,
+        "filename": payload.filename,
+        "document_length": len(payload.document),
+        "record_count": report.record_count,
+        "field_count": report.field_count,
+        "finding_count": len(findings),
+        "risk_level": highest_risk([f["risk_level"] for f in findings]),
+        "findings": findings,
+    }
+
+
 @app.post("/api/v1/identifiers/normalization", status_code=201)
 def create_identifier_normalization(payload: IdentifierNormalizationRequest) -> dict:
     """Extract Python identifiers and report NFKC normalisation collisions.
@@ -501,6 +544,7 @@ def root() -> dict:
             "POST /api/v1/audits",
             "POST /api/v1/audits/diff",
             "POST /api/v1/audits/json",
+            "POST /api/v1/audits/csv",
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",

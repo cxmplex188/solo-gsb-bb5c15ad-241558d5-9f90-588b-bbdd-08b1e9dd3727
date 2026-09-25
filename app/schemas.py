@@ -65,6 +65,25 @@ class JsonAuditRequest(BaseModel):
     )
 
 
+class CsvAuditRequest(BaseModel):
+    document: str = Field(
+        ...,
+        description=(
+            "Raw CSV document text. Parsed as comma-separated fields with "
+            "double-quoted enclosures ('\"\"' escapes a quote inside them) "
+            "and CRLF/LF record breaks; unclosed or misplaced quotes are "
+            "rejected with 422. Every cell is checked for a spreadsheet "
+            "formula trigger (=, +, -, @) hidden behind a prefix of "
+            "spaces, tabs or Unicode bidi control characters."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional document name, echoed back in the response.",
+    )
+
+
 class IdentifierNormalizationRequest(BaseModel):
     source: str = Field(
         ...,

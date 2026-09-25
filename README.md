@@ -50,7 +50,7 @@ docker compose up --build
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
-`POST /api/v1/audits/gate`、
+`POST /api/v1/audits/csv`、`POST /api/v1/audits/gate`、
 `POST /api/v1/identifiers/normalization`、
 `POST /api/v1/identifiers/normalization/fix-preview` 与
 `POST /api/v1/identifiers/mixed-script`
@@ -385,6 +385,87 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
 
 `invalid_json_document` 的 `detail` 含 `offset`（出错位置的码点偏移）与
 `line` / `column`（1 起始）。
+
+### `POST /api/v1/audits/csv` — CSV 单元格公式伪装审计
+
+接收一段**原始 CSV 文本**（`document` 字段，可选 `filename`），按以下规则解析：
+
+- 字段以逗号分隔；双引号包围的字段内可含逗号、CR/LF 换行与 `""` 转义引号
+  （解码为一个 `"`，定位到该对的第一个引号）；
+- 记录以 CRLF（作为整体消费）或 LF 分隔；单独的 `\r` 视为字段内容，因此行号
+  始终按分隔符所含的 `\n` 推进；
+- **引号不闭合**（`unclosed_quote`，定位到起始引号）或**非法引号**
+  （`illegal_quote`：未加引号的字段内出现 `"`，或闭合引号后紧跟非分隔符字符）
+  返回 422，`detail` 含原文码点偏移 `offset` 与 1 起始行列 `line` / `column`。
+
+随后逐个检查单元格：从单元格开头跳过**空格、制表符与 Unicode 双向控制符**
+（即 bidi 解析器编目中的全部控制符）后，若首字符是电子表格公式触发符
+`=`、`+`、`-`、`@` 之一，则报告一条命中——这正是 CSV/公式注入（以及用
+不可见字符伪装绕过 `startswith("=")` 检查）的典型形态。每条命中返回：
+
+- `record` / `field` — 1 起始的记录号与记录内字段号；
+- `formula_char` / `formula_offset` / `position` — 公式起始字符及其在原文中的
+  码点偏移与 1 起始行列；
+- `prefix` / `prefix_controls[]` — 被跳过的前缀原文与逐字符明细（`kind` 为
+  `space` / `tab` / bidi 缩写如 `RLO`，各带原文偏移 `offset` 与行列
+  `position`）；
+- `risk_level` — 复用 bidi 解析器对**该单元格解码后内容**给出的风险级别
+  （前缀里未闭合的 RLO 会把单元格直接推到 `critical`）。
+
+引号内换行、`""` 转义与空单元格都参与正常的记录/字段计数，不会造成记录号或
+位置错位。接口**只读**：`stored: false`，不写入任何记录。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/audits/csv \
+  -H 'Content-Type: application/json' \
+  -d '{"document": "name,note\r\nalice,ok\r\n  ‮=cmd,evil\r\n", "filename": "data.csv"}' | jq
+```
+
+响应（节选）：
+
+```json
+{
+  "stored": false,
+  "filename": "data.csv",
+  "document_length": 35,
+  "record_count": 3,
+  "field_count": 6,
+  "finding_count": 1,
+  "risk_level": "critical",
+  "findings": [
+    {
+      "record": 3,
+      "field": 1,
+      "formula_char": "=",
+      "formula_offset": 24,
+      "position": {"line": 3, "column": 4},
+      "prefix": "  ‮",
+      "prefix_controls": [
+        {"char": " ", "codepoint": "U+0020", "kind": "space",
+         "offset": 21, "position": {"line": 3, "column": 1}},
+        {"char": " ", "codepoint": "U+0020", "kind": "space",
+         "offset": 22, "position": {"line": 3, "column": 2}},
+        {"char": "‮", "codepoint": "U+202E", "kind": "RLO",
+         "offset": 23, "position": {"line": 3, "column": 3}}
+      ],
+      "risk_level": "critical"
+    }
+  ]
+}
+```
+
+> 上例第 3 条记录的单元格以两个空格 + RLO（U+202E）开头伪装 `=cmd`：
+> 肉眼看到的单元格像普通文本，但电子表格仍会把它当公式执行。顶层
+> `risk_level` 取全部命中单元格风险的最高值（无命中时为 `info`）。
+
+错误情况（均返回 `422`；接口只读，任何情况下都不写入记录）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `unclosed_quote` | 引号字段未闭合（`offset` 定位到起始引号） |
+| `illegal_quote` | 未加引号的字段内出现 `"`，或闭合引号后紧跟非分隔符字符 |
+
+缺少 `document` 字段返回 422（Pydantic 校验）。
 
 ### `POST /api/v1/identifiers/normalization` — Python 标识符 NFKC 碰撞检测
 
@@ -1058,6 +1139,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
+│   ├── csv_audit.py   # CSV 解析（引号/转义/CRLF）+ 公式伪装单元格审计（只读）
 │   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移、碰撞修复预览与拉丁/希腊/西里尔混写检测
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
@@ -1072,6 +1154,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
+│   ├── test_csv_audit.py # CSV 公式伪装审计（解析/前缀/位置/422/只读）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
 │   ├── test_mixed_script.py # 标识符混写检测（脚本分类/逐字符偏移/逐次报告/BOM/CRLF/422/不落库）
@@ -1139,7 +1222,12 @@ astral 平面码点偏移、CRLF 与前导 BOM）、仅不同原文拼写才算�
 覆盖按 Unicode 名称前缀的脚本分类（仅 LATIN/GREEK/CYRILLIC 计脚，组合记号、数字、
 下划线与全角/数学字母均中性）、两类及以上脚本命中、逐字符码点偏移与行列（含
 BOM/CRLF/多行）、同名逐次报告与多命中源码序、字符串/注释/关键字跳过与西里尔
-关键字形近词命中、词法失败 422 结构一致、缺字段 422，以及分析只读不产生任何记录。
+关键字形近词命中、词法失败 422 结构一致、缺字段 422，以及分析只读不产生任何记录；
+CSV 公式伪装审计覆盖逗号分隔/双引号包围/`""` 转义/CRLF 与 LF 记录分隔（单独
+`\r` 视为字段内容）解析、引号内换行与空单元格不造成记录/位置错位、空格/制表符/
+双向控制符前缀跳过后的 `=`/`+`/`-`/`@` 命中、记录号/字段号与原文行列映射、
+逐字符前缀明细（space/tab/bidi 缩写）、复用 bidi 解析器的单元格风险级别、
+未闭合/非法引号的 422 原文行列，以及接口只读不落库。
 
 ## 设计说明
 
